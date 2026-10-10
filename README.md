@@ -1,8 +1,43 @@
 # Manufacturing Failure Prediction Dashboard
 
+![Python](https://img.shields.io/badge/python-3.10%2B-blue?style=flat-square)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-1.9-orange?style=flat-square)
+![Streamlit](https://img.shields.io/badge/streamlit-1.65-red?style=flat-square)
+![SHAP](https://img.shields.io/badge/explainability-SHAP-9cf?style=flat-square)
+![Status](https://img.shields.io/badge/status-portfolio%20MVP-lightgrey?style=flat-square)
+
 A portfolio data science project: an end-to-end machine learning pipeline and Streamlit
 dashboard that predicts manufacturing machine failure from sensor/operating data, built
 for a Junior Data Scientist application at Michelin.
+
+**At a glance**
+
+| | |
+|---|---|
+| **Dataset** | [AI4I 2020](https://archive.ics.uci.edu/dataset/601/ai4i+2020+predictive+maintenance+dataset) — 10,000 rows, 339 failures (3.39%) |
+| **Problem** | Binary classification under heavy class imbalance |
+| **Model** | Random Forest (`class_weight="balanced"`), chosen over Logistic Regression via cross-validation |
+| **Test Recall / ROC-AUC** | **83.8%** / **97.0%** (held out, touched once) |
+| **Explainability** | SHAP (global + per-prediction) |
+| **Interface** | 5-page Streamlit dashboard |
+
+## Table of Contents
+
+- [Problem](#problem)
+- [Business Context](#business-context)
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Dataset](#dataset)
+- [Approach](#approach)
+- [Data Preparation](#data-preparation)
+- [Exploratory Analysis](#exploratory-analysis)
+- [Model Selection](#model-selection)
+- [Model Performance](#model-performance)
+- [Explainability](#explainability)
+- [Demo](#demo)
+- [Limitations](#limitations)
+- [Future Improvements](#future-improvements)
+- [How to Run](#how-to-run)
 
 ## Problem
 
@@ -18,6 +53,97 @@ in isolation — it's "which machines, out of many running in parallel, should g
 first?" A model that reliably flags high-risk machines lets a maintenance team spend limited
 inspection time where it matters most, instead of on a fixed schedule or waiting for a machine
 to actually break down.
+
+## Architecture
+
+The project is a one-way pipeline: raw data is cleaned and engineered once, a model is
+trained and persisted once, and the dashboard only ever *reads* those persisted artifacts —
+it never retrains. This keeps the app fast and keeps "what the model saw during training"
+and "what the app predicts with" provably identical (the dashboard calls the exact same
+`src/data_preprocessing.py` functions used at training time, so there is no train/serve skew).
+
+**1. End-to-end data & model flow**
+
+```mermaid
+flowchart LR
+    A["Raw CSV\ndata/raw/ai4i2020.csv"] --> B["data_preprocessing.py\nclean, engineer, split"]
+    B --> C["data/processed/\ntrain.csv and test.csv"]
+    C --> D["train.py\nCV and model selection"]
+    D --> E["models/\nmodel.joblib and metrics.json"]
+    E --> F["predict.py\ninference and SHAP"]
+    F --> G["app.py\nStreamlit dashboard"]
+    G --> H["User"]
+```
+
+**2. Training methodology — how test-set leakage is avoided**
+
+The threshold and the model itself are both chosen using only the training split; the test
+set is touched exactly once, at the very end, purely to report final numbers.
+
+```mermaid
+flowchart TD
+    subgraph TR["Training split: 80 percent, 8000 rows"]
+        T1["5-fold Stratified CV"] --> T2["Logistic Regression\nclass_weight=balanced"]
+        T1 --> T3["Random Forest\ngrid search, class_weight=balanced"]
+        T2 --> T4{"Compare CV recall"}
+        T3 --> T4
+        T4 --> T5["Random Forest selected\n0.919 CV recall vs 0.823"]
+        T5 --> T6["Pick threshold from CV\nprecision-recall curve\ntarget recall at least 0.8"]
+        T6 --> T7["Fit final model on\nfull training split"]
+    end
+    subgraph TS["Held-out test split: 20 percent, 2000 rows, untouched until now"]
+        T7 --> U1["Predict once"]
+        U1 --> U2["Final metrics:\n83.8 percent recall, 97.0 percent ROC-AUC"]
+    end
+```
+
+**3. Live prediction — what happens when you click "Predict"**
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant App as app.py
+    participant Pr as predict.py
+    participant M as model.joblib
+    participant Sh as SHAP TreeExplainer
+
+    U->>App: Set sliders (temp, rpm, torque, wear, type)
+    App->>Pr: predict_single(model, raw_inputs)
+    Pr->>Pr: build_input_row() — same feature engineering as training
+    Pr->>M: predict_proba(X)
+    M-->>Pr: failure probability
+    Pr-->>App: probability + risk_category
+    App->>Pr: top_factors(model, raw_inputs)
+    Pr->>Sh: shap_values(X)
+    Sh-->>Pr: per-feature contribution
+    Pr-->>App: top 3 factors (direction + magnitude)
+    App-->>U: Risk badge + probability + factors
+```
+
+## Project Structure
+
+```
+manufacturing-failure-prediction/
+├── data/
+│   ├── raw/ai4i2020.csv          # downloaded, untouched
+│   └── processed/                 # output of data_preprocessing.py
+│       ├── train.csv
+│       └── test.csv
+├── models/                        # output of train.py — loaded by app.py, never regenerated by it
+│   ├── model.joblib
+│   └── metrics.json
+├── notebooks/
+│   └── 01_eda.ipynb                # exploratory analysis behind the feature/model choices below
+├── src/
+│   ├── data_preprocessing.py       # load → clean → engineer features → split
+│   ├── train.py                    # CV model selection → threshold → fit → persist
+│   ├── predict.py                  # inference + SHAP explainability (shared by train.py and app.py)
+│   └── evaluation.py               # metric/confusion-matrix/ROC helpers (shared by train.py and app.py)
+├── tests/                          # unit tests for the three src/ modules above
+├── app.py                          # Streamlit dashboard (5 pages)
+├── requirements.txt
+└── README.md
+```
 
 ## Dataset
 
@@ -46,7 +172,7 @@ Binary classification under class imbalance. Two models are compared — **Logis
 Regression** (baseline) and **Random Forest** — both with `class_weight="balanced"`, selected
 via 5-fold stratified cross-validation on the training split (not the test set), scored on
 recall. The chosen model is fit once on the full training split, and evaluated exactly once
-on a held-out test set.
+on a held-out test set. See [Architecture](#architecture) above for the full methodology flow.
 
 **Primary metric: Recall** on the failure class. In this problem, a false negative (a real
 failure the model misses) risks unplanned downtime; a false positive (a false alarm) only
@@ -124,7 +250,8 @@ maintenance is meant to exploit.
   `rotational_speed_rpm`, `power_w`, `torque_nm`.
 - **Local**: the same SHAP explainer applied to a single input row, shown on the "Failure
   Prediction" page as the top 3 contributing factors for that specific prediction, with
-  direction (increases/decreases risk).
+  direction (increases/decreases risk). See the sequence diagram in
+  [Architecture](#architecture) for exactly how this is wired.
 - Fallback (if a Logistic Regression were ever selected instead): coefficient × input value
   as a linear per-feature contribution, and `|coefficient|` for global importance — no SHAP
   dependency needed for a linear model.
